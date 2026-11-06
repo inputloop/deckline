@@ -1,0 +1,4 @@
+Vendored: StreamDeck/ (the Python package from src/) and LICENSE-streamdeck, unmodified.
+From: https://github.com/StreamController/sc-python-elgato-streamdeck  commit ca683c4 (2026-08-16)
+Licence: MIT (see LICENSE-streamdeck). Copied 2026-11-06.
+To update: replace StreamDeck/ with the new src/StreamDeck/ and re-run tests/run.sh.

@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+# deckline - drive an Elgato Stream Deck by lines on stdin and stdout.
+#
+# Copyright 2026 Corwin Brust <corwin@bru.st>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.  It is distributed WITHOUT ANY WARRANTY; see COPYING.
+#
+# Mentat (for Corwin, claude-sonnet-5-5)
+"""deckline: one small helper that any program can drive with plain lines.
+
+Read README.md for the protocol.  In short: one command per input line,
+exactly one reply line per command (`ok ...` or `error ...`), `deck` lines
+before the `ok` of `list`, and events (`press K`, `release K`, `dial ...`,
+`touch ...`) whenever the hardware says so.
+"""
+
+import io
+import os
+import sys
+import threading
+
+VERSION = "0.1.0"
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+MSG_HIDAPI = ("error hidapi not found: install mingw-w64-ucrt-x86_64-hidapi "
+              "or put hidapi.dll beside deckline")
+MSG_BUSY = "error deck busy: another program (perhaps the Elgato app) holds it"
+MSG_NOLIB = ("error StreamDeck library not found: put it in the vendor folder "
+             "beside deckline, set DECKLINE_LIB, or pip install it")
+
+
+class DeckError(Exception):
+    """An error with a message already in plain words for the wire."""
+
+
+# ---------------------------------------------------------------- parsing
+
+def split_line(text):
+    """Split a command line into words.
+
+    Words are separated by spaces.  A word may be wrapped in double quotes
+    to hold spaces.  Inside quotes only \\" (a quote), \\\\ (a backslash)
+    and \\n (a new line) are escapes, so Windows paths survive untouched.
+    """
+    words, cur, quoted, have = [], [], False, False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quoted:
+            if c == "\\" and i + 1 < len(text) and text[i + 1] in '"\\n':
+                nxt = text[i + 1]
+                cur.append("\n" if nxt == "n" else nxt)
+                i += 2
+                continue
+            if c == '"':
+                quoted = False
+            else:
+                cur.append(c)
+        elif c == '"':
+            quoted, have = True, True
+        elif c in " \t":
+            if cur or have:
+                words.append("".join(cur))
+                cur, have = [], False
+        else:
+            cur.append(c)
+        i += 1
+    if quoted:
+        raise DeckError("error unbalanced quote")
+    if cur or have:
+        words.append("".join(cur))
+    return words
+
+
+# ---------------------------------------------------------------- images
+
+def to_native(img, fmt):
+    """Scale `img` to fit the key on black and encode it as the deck wants.
+
+    `fmt` is the library's key_image_format() dict: size, format, flip,
+    rotation.  Returns the bytes for set_key_image.
+    """
+    from PIL import Image
+    w, h = fmt["size"]
+    canvas = Image.new("RGB", (w, h), "black")
+    thumb = img.convert("RGBA")
+    thumb.thumbnail((w, h), Image.LANCZOS)
+    canvas.paste(thumb, ((w - thumb.width) // 2, (h - thumb.height) // 2), thumb)
+    if fmt["rotation"]:
+        canvas = canvas.rotate(fmt["rotation"], expand=True)
+    if fmt["flip"][0]:
+        canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
+    if fmt["flip"][1]:
+        canvas = canvas.transpose(Image.FLIP_TOP_BOTTOM)
+    buf = io.BytesIO()
+    canvas.save(buf, fmt["format"], quality=100)
+    return buf.getvalue()
+
+
+def _font(size):
+    from PIL import ImageFont
+    for name in ("arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def render_text(label, fmt):
+    """White text, centred, on black, as large as will fit the key."""
+    from PIL import Image, ImageDraw
+    w, h = fmt["size"]
+    img = Image.new("RGB", (w, h), "black")
+    draw = ImageDraw.Draw(img)
+    for size in range(h, 5, -2):
+        font = _font(size)
+        box = draw.multiline_textbbox((0, 0), label, font=font, align="center")
+        if box[2] - box[0] <= w - 4 and box[3] - box[1] <= h - 4:
+            break
+    x = (w - (box[2] - box[0])) // 2 - box[0]
+    y = (h - (box[3] - box[1])) // 2 - box[1]
+    draw.multiline_text((x, y), label, font=font, fill="white", align="center")
+    return img
+
+
+def black_image(fmt):
+    from PIL import Image
+    return Image.new("RGB", tuple(fmt["size"]), "black")
+
+
+# ---------------------------------------------------------------- the fake
+
+class FakeDeck:
+    """A simulated 15-key deck (5x3, 72x72 JPEG) with the library's shape."""
+
+    def __init__(self):
+        self.opened = False
+        self.brightness = None
+        self.images = {}
+        self.key_callback = None
+        self.dial_callback = None
+        self.touchscreen_callback = None
+
+    def deck_type(self): return "Stream Deck Fake"
+    def get_serial_number(self): return "FAKE00000001"
+    def key_count(self): return 15
+    def key_layout(self): return (3, 5)          # rows, cols, as the library
+    def dial_count(self): return 0
+    def is_visual(self): return True
+    def is_touch(self): return False
+
+    def key_image_format(self):
+        return {"size": (72, 72), "format": "JPEG", "flip": (True, True),
+                "rotation": 0}
+
+    def open(self): self.opened = True
+    def close(self): self.opened = False
+    def reset(self): self.images.clear()
+    def set_brightness(self, pct): self.brightness = pct
+    def set_key_image(self, key, data): self.images[key] = data
+    def set_key_callback(self, cb): self.key_callback = cb
+    def set_dial_callback(self, cb): self.dial_callback = cb
+    def set_touchscreen_callback(self, cb): self.touchscreen_callback = cb
+
+
+# ---------------------------------------------------------------- library
+
+def load_library():
+    """Return (DeviceManager, ProbeError), looking in the usual places."""
+    where = [os.environ.get("DECKLINE_LIB"), os.path.join(HERE, "vendor")]
+    tried = []
+    for d in where + [None]:
+        if d:
+            if not os.path.isdir(os.path.join(d, "StreamDeck")):
+                continue
+            sys.path.insert(0, d)
+        try:
+            from StreamDeck.DeviceManager import DeviceManager, ProbeError
+            return DeviceManager, ProbeError
+        except ImportError as e:
+            tried.append(str(e))
+            if d:
+                sys.path.remove(d)
+    raise DeckError(MSG_NOLIB)
+
+
+def real_decks():
+    # Let ctypes find a hidapi.dll that sits beside this program.
+    if HERE not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = HERE + os.pathsep + os.environ.get("PATH", "")
+    manager, probe_error = load_library()
+    try:
+        return manager().enumerate()
+    except probe_error:
+        raise DeckError(MSG_HIDAPI)
+
+
+# ---------------------------------------------------------------- session
+
+class Session:
+    def __init__(self, fake, out):
+        self.fake = fake
+        self.out = out
+        self.lock = threading.Lock()
+        self.listing = None          # [(deck, info)] from the last list
+        self.deck = None             # the open one
+        self.info = None
+
+    # -- output
+    def say(self, text):
+        with self.lock:
+            self.out.write(text + "\n")
+            self.out.flush()
+
+    # -- decks
+    def describe(self, deck, serial):
+        rows, cols = deck.key_layout()
+        if deck.is_visual():
+            w, h = deck.key_image_format()["size"]
+        else:
+            w = h = 0
+        return {"model": deck.deck_type().replace(" ", "-"), "serial": serial,
+                "keys": deck.key_count(), "cols": cols, "rows": rows,
+                "w": w, "h": h}
+
+    def enumerate(self):
+        if self.fake:
+            decks = [FakeDeck()]
+        else:
+            decks = real_decks()
+        listing = []
+        for deck in decks:
+            try:
+                deck.open()
+                serial = deck.get_serial_number()
+                deck.close()
+            except Exception:
+                serial = "busy"
+            listing.append((deck, self.describe(deck, serial)))
+        return listing
+
+    def need_deck(self):
+        if self.deck is None:
+            raise DeckError("error no deck is open: send open N first")
+        return self.deck
+
+    def need_visual(self):
+        deck = self.need_deck()
+        if not deck.is_visual():
+            raise DeckError("error this deck has no key screens")
+        return deck
+
+    def key_number(self, word):
+        deck = self.need_deck()
+        try:
+            k = int(word)
+        except ValueError:
+            raise DeckError("error key must be a number, not " + word)
+        if not 0 <= k < deck.key_count():
+            raise DeckError("error key %d is out of range 0-%d"
+                            % (k, deck.key_count() - 1))
+        return k
+
+    # -- events
+    def on_key(self, deck, key, state):
+        self.say(("press %d" if state else "release %d") % key)
+
+    def on_dial(self, deck, dial, kind, value):
+        name = getattr(kind, "name", str(kind)).lower()
+        if name == "turn":
+            self.say("dial %d turn %d" % (dial, value))
+        else:
+            self.say("dial %d %s" % (dial, "press" if value else "release"))
+
+    def on_touch(self, deck, kind, value):
+        name = getattr(kind, "name", str(kind)).lower()
+        if name == "drag":
+            self.say("touch drag %d %d %d %d" % (
+                value["x"], value["y"], value.get("x_out", 0), value.get("y_out", 0)))
+        else:
+            self.say("touch %s %d %d" % (name, value["x"], value["y"]))
+
+    # -- commands
+    def close_deck(self):
+        if self.deck is not None:
+            try:
+                self.deck.close()
+            except Exception:
+                pass
+            self.deck = None
+
+    def do(self, words):
+        """Run one command; return True to stop."""
+        cmd, args = words[0], words[1:]
+        handler = getattr(self, "cmd_" + cmd.replace("-", "_"), None)
+        if handler is None or cmd.startswith("_") or (
+                cmd == "sim" and not self.fake):
+            raise DeckError("error unknown command: " + cmd)
+        return handler(args)
+
+    def expect(self, args, n, usage):
+        if len(args) != n:
+            raise DeckError("error usage: " + usage)
+
+    def cmd_list(self, args):
+        self.expect(args, 0, "list")
+        if self.deck is None or self.listing is None:
+            self.listing = self.enumerate()
+        for i, (_, d) in enumerate(self.listing):
+            self.say("deck %d %s %s %d %dx%d %dx%d" % (
+                i, d["model"], d["serial"], d["keys"], d["cols"], d["rows"],
+                d["w"], d["h"]))
+        self.say("ok list %d" % len(self.listing))
+
+    def cmd_open(self, args):
+        self.expect(args, 1, "open N")
+        try:
+            n = int(args[0])
+        except ValueError:
+            raise DeckError("error deck must be a number, not " + args[0])
+        if self.listing is None:
+            self.listing = self.enumerate()
+        if not 0 <= n < len(self.listing):
+            raise DeckError("error no deck %d (found %d)" % (n, len(self.listing)))
+        self.close_deck()
+        deck, info = self.listing[n]
+        try:
+            deck.open()
+        except Exception:
+            raise DeckError(MSG_BUSY)
+        deck.set_key_callback(self.on_key)
+        deck.set_dial_callback(self.on_dial)
+        deck.set_touchscreen_callback(self.on_touch)
+        self.deck, self.info = deck, info
+        self.say("ok open %d" % n)
+
+    def cmd_brightness(self, args):
+        self.expect(args, 1, "brightness PCT")
+        deck = self.need_deck()
+        try:
+            pct = int(args[0])
+        except ValueError:
+            raise DeckError("error brightness must be a whole number 0-100")
+        if not 0 <= pct <= 100:
+            raise DeckError("error brightness must be a whole number 0-100")
+        deck.set_brightness(pct)
+        self.say("ok brightness %d" % pct)
+
+    def cmd_key(self, args):
+        if len(args) < 2:
+            raise DeckError('error usage: key K image PATH | key K text "LABEL" | key K clear')
+        deck = self.need_visual()
+        k = self.key_number(args[0])
+        what, rest = args[1], args[2:]
+        fmt = deck.key_image_format()
+        if what == "clear":
+            self.expect(rest, 0, "key K clear")
+            img = black_image(fmt)
+        elif what == "text":
+            self.expect(rest, 1, 'key K text "LABEL"')
+            img = render_text(rest[0], fmt)
+        elif what == "image":
+            self.expect(rest, 1, "key K image PATH")
+            try:
+                from PIL import Image
+                img = Image.open(rest[0])
+                img.load()
+            except FileNotFoundError:
+                raise DeckError("error no such file: " + rest[0])
+            except Exception:
+                raise DeckError("error cannot read an image from " + rest[0])
+        else:
+            raise DeckError("error key action must be image, text or clear")
+        deck.set_key_image(k, to_native(img, fmt))
+        self.say("ok key %d %s" % (k, what))
+
+    def cmd_reset(self, args):
+        self.expect(args, 0, "reset")
+        self.need_deck().reset()
+        self.say("ok reset")
+
+    def cmd_quit(self, args):
+        self.expect(args, 0, "quit")
+        self.close_deck()
+        self.say("ok quit")
+        return True
+
+    # -- the simulator, --fake only
+    def cmd_sim(self, args):
+        deck = self.need_deck()
+        if len(args) == 2 and args[0] in ("press", "release"):
+            k = self.key_number(args[1])
+            deck.key_callback(deck, k, args[0] == "press")
+        elif len(args) == 2 and args[0] == "dump":
+            k = self.key_number(args[1])
+            from PIL import Image
+            data = deck.images.get(k)
+            if data is None:
+                raise DeckError("error key %d has no image" % k)
+            im = Image.open(io.BytesIO(data))
+            self.say("image %d %s %dx%d %d" % (k, im.format, im.width, im.height, len(data)))
+        elif len(args) == 1 and args[0] == "brightness":
+            self.say("brightness %s" % deck.brightness)
+        else:
+            raise DeckError("error usage: sim press K | sim release K | sim dump K | sim brightness")
+        self.say("ok sim")
+
+    def run(self, lines):
+        for raw in lines:
+            line = raw.strip("\r\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            try:
+                words = split_line(line)
+                if self.do(words):
+                    return
+            except DeckError as e:
+                self.say(str(e))
+            except Exception as e:                       # never die on a bad command
+                self.say("error %s: %s" % (type(e).__name__, e))
+        self.close_deck()
+
+
+def main(argv):
+    if "--version" in argv:
+        print("deckline " + VERSION)
+        return 0
+    if "--help" in argv or "-h" in argv:
+        print("usage: deckline [--fake]\n"
+              "Reads commands from stdin, one per line: list, open N, "
+              "brightness PCT,\nkey K image PATH, key K text \"LABEL\", key K clear, "
+              "reset, quit.\nSee README.md.")
+        return 0
+    unknown = [a for a in argv if a != "--fake"]
+    if unknown:
+        sys.stderr.write("deckline: unknown option %s\n" % unknown[0])
+        return 2
+    try:
+        sys.stdout.reconfigure(newline="\n", encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    Session("--fake" in argv, sys.stdout).run(sys.stdin)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
